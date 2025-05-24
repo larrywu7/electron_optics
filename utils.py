@@ -117,7 +117,7 @@ def trim_hist(
         file_list,
         output_values_start=output_values_start, 
         output_values_end=output_values_end,
-        trim_threshold=trim_threshold
+        trim_threshold=trim_threshold,**kwargs
     )
     
     # Create subplots
@@ -205,7 +205,7 @@ def trim_scatter(data_paths:list[str], voltages_start:int=None ,voltages_end:int
             q1 = np.percentile(output_values, 25, axis=0)
             q3 = np.percentile(output_values, 75, axis=0)
             iqr = q3 - q1
-            scores = (output_values - q1) / iqr
+            scores = (np.abs(output_values - q1) / iqr)
 
 
 

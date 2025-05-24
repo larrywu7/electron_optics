@@ -40,7 +40,7 @@ def load_data(data_paths:list[str], voltages_start:int=None ,voltages_end:int=13
             q1 = np.percentile(output_values, 25, axis=0)
             q3 = np.percentile(output_values, 75, axis=0)
             iqr = q3 - q1
-            scores = (output_values - q1) / iqr
+            scores = (np.abs(output_values - q1) / iqr)
 
 
 
