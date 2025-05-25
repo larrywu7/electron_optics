@@ -74,7 +74,7 @@ class ElectronOpticsPredictor:
         
         print(f"Using device: {self.device}")
     
-    def _normalize_data(self, data: np.ndarray, scaler=None, fit: bool = False):
+    def _normalize_data(self, data: np.ndarray, scaler:np.ndarray=None, fit: bool = False):
         """Normalize data using min-max scaling"""
         if fit or scaler is None:
             scaler = {
@@ -365,34 +365,121 @@ class ElectronOpticsPredictor:
         self.scaler_values = checkpoint.get('scaler_values')
 
 
+def optimize_voltages(   predictors:list[ElectronOpticsPredictor]= None,
+                         objective_function: Callable = None,
+                         value_index: int = 0,
+                         weights: list = None,
+                         n_iterations: int = 1000,
+                         learning_rate: float = 0.1,
+                         random_restarts: int = 5,
+                         voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+                         constrain_to_training_range: bool = False):
+        """Find voltages that optimize the predicted values according to a custom objective
+        
+        Args:
+            objective_function: Custom function that takes the model prediction tensor and returns a scalar to maximize
+                                Example: lambda pred: pred[:, 0] - 0.5 * pred[:, 1]
+            value_index: Index of the value to optimize if optimizing a single output
+            weights: Weights for each output value for weighted optimization; 
+                     positive for maximization, negative for minimization
+            n_iterations: Number of optimization iterations
+            learning_rate: Learning rate for optimization
+            random_restarts: Number of random starting points to try
+            voltage_bounds: Tuple of (min_voltages, max_voltages) to constrain optimization
+            constrain_to_training_range: If True, constrains voltages to the range seen during training.
+                                         If False, allows exploration beyond training data range.
 
-'''
-n_voltages = 14     # Number of voltage parameters
-n_output_values = 2 # Number of output values (e.g., magnification, aberration, etc.)
+
+        Returns:
+            best_voltages: Optimal voltage settings
+            best_values: Predicted values at the optimal voltage settings
+            best_objective: Value of the objective function at the optimal point
+        """
+        if predictors is None or len(predictors) == 0:
+            raise ValueError("At least one ElectronOpticsPredictor instance must be provided.")
+        best_voltages = None
+        best_values = None
+        best_objective = float('-inf')
+        device = predictors[0].device
+        scaler_voltages = np.ndarray([predictor.scaler_voltages for predictor in predictors])
+        scalar_values = np.ndarray([predictor.scaler_values for predictor in predictors])
+        # Define the objective function
+        if objective_function is None:
+            if weights is not None:
+                # Weighted sum of values
+                def objective_func(pred):
+                    return torch.sum(pred * torch.tensor(weights, device=device, dtype=torch.float32))
+            else:
+                # Maximize single value
+                def objective_func(pred):
+                    return pred[:, value_index]
+        else:
+            # Use the provided custom objective function
+            objective_func = objective_function
+        
+        for restart in range(random_restarts):
+            # Initialize voltages
+            if voltage_bounds is not None:
+                voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1])
+            else:
+                voltages = np.random.uniform(-1, 1, size=predictors[0].input_dim)
+            
+            # Normalize initial voltages
+            voltages_norm, scaler_voltages= normalize_data(voltages.reshape(1, -1),scaler_voltages)
+            voltages_norm = voltages_norm.flatten()
+            
+            # Convert to tensor and require gradients
+            voltages_tensor = torch.FloatTensor(voltages_norm).to(device)
+            voltages_tensor.requires_grad_(True)
+            
+            optimizer = optim.Adam([voltages_tensor], lr=learning_rate)
+            \
+            for iteration in range(n_iterations):
+                optimizer.zero_grad()
+                
+                # Predict values
+                predictions=torch.empty(0, dtype=torch.float32, device=device)
+                for predictor in predictors:
+                    prediction = predictor.model(voltages_tensor.unsqueeze(0))
+                    predictions = torch.cat((predictions, prediction), dim=0)
+                predictions = predictions.to(device)
+
+                
+                predictions = denormalize_data(predictions.cpu().numpy(), scalar_values)
+                predictions = torch.FloatTensor(predictions).to(device)
+                    
+                # Compute objective (negative for maximization)
+                loss = -objective_func(predictions)
+                
+                loss.backward()
+                optimizer.step()
+                
+                # Optionally constrain to training range
+                if constrain_to_training_range:
+                    with torch.no_grad():
+                        voltages_tensor.clamp_(0, 1)
+            
+            # Get final result
+            with torch.no_grad():
+                final_predictions=torch.empty(0, dtype=torch.float32, device=device)
+                for predictor in predictors:
+                    final_prediction = predictor.model(voltages_tensor.unsqueeze(0))
+                    final_predictions = torch.cat((final_predictions, final_prediction), dim=0)
+                final_predictions = final_predictions.to(device)
+
+               
+                final_predictions = denormalize_data(final_predictions.cpu().numpy(), scalar_values)
+                final_objective = objective_func(final_predictions).item()
+                
+                if final_objective > best_objective:
+                    best_objective = final_objective
+                    best_voltages = denormalize_data(voltages_tensor.cpu().numpy().reshape(1, -1), scaler_voltages)
+                    best_values = final_predictions
+        
+        return best_voltages, best_values, best_objective #best_values is best predicted output_values and best_objective is best metric value. 
 
 
 
-voltages, output_values =load_data(['parallel_test_model_data.csv','test_model_data.csv'], output_values_start=14, output_values_end=16)
-# Create and train model
-predictor = ElectronOpticsPredictor(input_dim=n_voltages, output_dim=n_output_values,leak=0.2)
-
-print("Training model...")
-predictor.train(voltages, output_values, epochs=500, verbose=True)
-
-# Make predictions with the trained model
-test_voltages = np.random.uniform(-10, 10, size=(5, n_voltages))
-predicted_values = predictor.predict(test_voltages)
-
-print("\nTest predictions:")
-for i in range(len(test_voltages)):
-    print(f"Sample {i}: {predicted_values[i]}")
-
-# Example optimization using a custom objective function
-print("\nOptimizing voltages...")
-voltage_bounds = (np.full(n_voltages, -10), np.full(n_voltages, 10))
-
-# Define a custom objective function
-# Replace this with your own function that defines what "good" means for your system
 def custom_objective(pred):
     """
     Custom objective function to optimize.
@@ -405,6 +492,33 @@ def custom_objective(pred):
         return pred[0][0]**2 + (torch.abs(pred[0][1])-0.1)**2 + pred[0][2]**2+pred[0][3]**2+pred[0][4]**2+pred[0][5]**2 + (torch.abs(pred[0][6])-500)**2 + pred[0][7]**2+pred[0][8]**2+pred[0][9]**2+pred[0][10]**2+pred[0][11]**2
     else:
         return pred[0][0]**2 + (np.abs(pred[0][1])-0.1)**2 + pred[0][2]**2+pred[0][3]**2+pred[0][4]**2+pred[0][5]**2 + (np.abs(pred[0][6])-500)**2 + pred[0][7]**2+pred[0][8]**2+pred[0][9]**2+pred[0][10]**2+pred[0][11]**2
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+n_voltages = 14     # Number of voltage parameters
+n_output_values = 2 # Number of output values (e.g., magnification, aberration, etc.)
+
+
+
+
+# Example optimization using a custom objective function
+print("\nOptimizing voltages...")
+voltage_bounds = (np.full(n_voltages, -10), np.full(n_voltages, 10))
+
+# Define a custom objective function
+# Replace this with your own function that defines what "good" means for your system
+
 # Run optimization allowing exploration beyond training range
 optimal_voltages, optimal_values, obj_value = predictor.optimize_voltages(
     objective_function=custom_objective,

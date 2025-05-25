@@ -44,13 +44,13 @@ def run_inference(predictor: ElectronOpticsPredictor=None, batch_size: int = 32,
     return all_predictions, all_true_values
 
 
-def plot_inference_comparison(predictor, n_samples=10, subplot_shape: Tuple[int, ...]=(3,5),figsize=(20, 10),**kwargs):
+def plot_inference_comparison(predictor, n_samples: int=None, subplot_shape: Tuple[int, ...]=(3,5),figsize=(20, 10),**kwargs):
 
     """Simple wrapper for inference plotting."""
     all_predictions, all_true_values = run_inference(predictor,**kwargs)
     fig, ax = plt.subplots(*subplot_shape, figsize=figsize)
     ax = ax.flatten()
-    
+    n_samples=len(all_predictions) if n_samples is None else n_samples
     x_range = np.arange(n_samples)
     for v in range(all_predictions.shape[1]):  # auto-detect n_output_values
         ax[v].scatter(x_range, all_predictions[:n_samples, v], 
@@ -78,6 +78,7 @@ def trim_hist(
     hist_bins: int = 100,
     point_size: int = 100,
     alpha: float = 0.5,
+    plot_output: bool = False,
     **kwargs: Any
 ) -> Tuple[Any, Any, Any, Any, plt.Figure, np.ndarray]:
     """
@@ -147,6 +148,26 @@ def trim_hist(
             )
             ax[v].set_title(f'Voltage Channel {v+1}')
             ax[v].legend()
+    if plot_output:
+        n_output_values = output_values.shape[1]
+        for v in range(n_output_values):
+                # Make sure we don't exceed subplot count
+                ax[v+n_voltage_channels].hist(
+                    output_values_unclean[:, v], 
+                    bins=hist_bins, 
+                    color=colors['unclean'], 
+                    alpha=alpha, 
+                    label='Uncleaned outputs'
+                )
+                ax[v+n_voltage_channels].hist(
+                    output_values[:, v], 
+                    bins=hist_bins, 
+                    color=colors['clean'], 
+                    alpha=alpha, 
+                    label='Cleaned outputs'
+                )
+                ax[v+n_voltage_channels].set_title(f'Output {v+1}')
+                ax[v+n_voltage_channels].legend()
     
     plt.tight_layout()
     
@@ -236,3 +257,29 @@ def trim_scatter(data_paths:list[str], voltages_start:int=None ,voltages_end:int
 
 
     return fig, ax, voltages, output_values, voltages_masked, output_values_masked
+
+
+
+def normalize_data(data: np.ndarray, scaler=None):
+    """Normalize data using min-max scaling"""
+    if scaler is None:
+        scaler = {
+            'min': np.min(data, axis=0),
+            'max': np.max(data, axis=0)
+        }
+    
+    # Avoid division by zero
+    range_vals = scaler['max'] - scaler['min']
+    range_vals[range_vals == 0] = 1
+    
+    normalized = (data - scaler['min']) / range_vals
+    return normalized, scaler
+
+def denormalize_data(normalized_data: np.ndarray, scaler: Dict[str, np.ndarray]):
+    """Denormalize data using min-max scaling"""
+    # Avoid division by zero
+    range_vals = scaler['max'] - scaler['min']
+    range_vals[range_vals == 0] = 1
+    
+    denormalized = normalized_data * range_vals + scaler['min']
+    return denormalized
