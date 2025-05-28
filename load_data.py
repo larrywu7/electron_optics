@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
+from typing import Tuple, Optional, Callable,Union
 
-def load_data(data_paths:list[str], voltages_start:int=None ,voltages_end:int=13, output_values_start: int=14, output_values_end: int=None, trim_mode: str='z-score' , trim_threshold: float| list[float]=None):
+def load_data(data_paths:list[str], voltages_start:int=None ,voltages_end:int=13, output_values_start: int=14, output_values_end: int=None, trim_mode: str='z-score' , trim_threshold: Union[float, list[float]]=None):
     """
     Load data from multiple CSV files, convert to numeric, and split into voltages and output values.
 
