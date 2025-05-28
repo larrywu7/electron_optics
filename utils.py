@@ -7,9 +7,10 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Tuple, Optional, Dict, Any
 import matplotlib.pyplot as plt
+import random
 from model import *
 from load_data import load_data
-def run_inference(predictor: ElectronOpticsPredictor=None, batch_size: int = 32, use_training_ds: bool = False):
+def run_inference(predictor: ElectronOpticsPredictor=None, batch_size: int = 32, use_training_ds: bool = False,shuffle: bool = True) -> Tuple[np.ndarray, np.ndarray]:
 
 
     if predictor is None:
@@ -17,7 +18,7 @@ def run_inference(predictor: ElectronOpticsPredictor=None, batch_size: int = 32,
 
     
     dataset = predictor.train_ds if use_training_ds else predictor.val_ds
-    ds_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    ds_loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     #Run inference on validation loader
     predictor.model.eval()  # Set model to evaluation mode
@@ -230,27 +231,32 @@ def trim_scatter(data_paths:list[str], voltages_start:int=None ,voltages_end:int
             scores = (np.abs(output_values - q1) / iqr)
 
 
-
+        # trim_threshold= [trim_threshold] * output_values.shape[1] if isinstance(trim_threshold, (int, float)) else trim_threshold
         # Create mask for rows without outliers (no column has z-score > threshold)
         outlier_mask = np.any(scores > trim_threshold, axis=1)
-
+        
         # Apply the mask to both arrays to keep them aligned
         voltages_masked= voltages.copy().astype(float)
         output_values_masked= output_values.copy().astype(float)
         voltages_masked[outlier_mask]= np.nan
         output_values_masked[outlier_mask]= np.nan
 
-
     fig,ax=plt.subplots(*subplot_shape, figsize=figsize)
     ax = ax.flatten()
 
 
     for v in range(output_values.shape[1]):  
-        ax[v].scatter(np.arange(len(output_values)), output_values[:,v], label='full', color='k',s=100,marker='o')
+        output_value= output_values[:,v]
+        output_value=np.random.permutation(output_value)  # Randomize order for better visibility
+        ax[v].scatter(np.arange(len(output_values)), output_value, label='full', color='k',s=100,marker='o')
     for v in range(output_values_masked.shape[1]):  
-        ax[v].scatter(np.arange(len(output_values_masked)), output_values_masked[:,v], label='trimmed', color='b',s=10,marker='o')
+        output_value_masked= output_values_masked[:,v]
+        output_value_masked=np.random.permutation(output_value_masked)  # Randomize order for better visibility
+        ax[v].scatter(np.arange(len(output_values_masked)), output_value_masked, label='trimmed', color='b',s=10,marker='o')
         ax[v].set_title(f'Output {v+1}')
         ax[v].legend()
+        # ax[v].axhline(np.mean(output_values[v], axis=0)+trim_threshold[v]*np.std(output_values, axis=0)[v], color='red', linestyle='--', linewidth=1)
+        # ax[v].axhline(np.mean(output_values[v], axis=0)-trim_threshold[v]*np.std(output_values, axis=0)[v], color='red', linestyle='--', linewidth=1)
         
     
     plt.tight_layout()

@@ -24,7 +24,7 @@ class ElectronOpticsDataset(Dataset):
 
 class ElectronOpticsModel(nn.Module):
     """Neural network model for predicting electron optics values from voltages"""
-    def __init__(self, input_dim: int, output_dim: int = 1, hidden_dims: list = [32,64,128,256,128, 64,32],leak: float = 0.0):
+    def __init__(self, input_dim: int=1, output_dim: int = 1, hidden_dims: list = [32,64,128,256,128, 64,32],leak: float = 0.0):
         super(ElectronOpticsModel, self).__init__()
         self.hidden_dims = hidden_dims
         # Build the network
@@ -51,17 +51,9 @@ class ElectronOpticsModel(nn.Module):
 class ElectronOpticsPredictor:
     """Main class for training and using the electron optics prediction model"""
     
-    def __init__(self, input_dim: int, output_dim: int = 1, device: str = None,leak: float = 0.0):
-        if device is None:
-            # Check for available devices in order of preference: MPS, CUDA, CPU
-            if torch.backends.mps.is_available():
-                self.device = torch.device('mps')
-            elif torch.cuda.is_available():
-                self.device = torch.device('cuda')
-            else:
-                self.device = torch.device('cpu')
-        else:
-            self.device = torch.device(device)
+    def __init__(self, input_dim: int, output_dim: int = 1, device: Union[str,None]= None,leak: float = 0.0):
+        device = self.get_device() if device is None else device
+        self.device = torch.device(device)
         
         self.model = ElectronOpticsModel(input_dim, output_dim,leak=leak).to(self.device)
         self.input_dim = input_dim
@@ -232,8 +224,20 @@ class ElectronOpticsPredictor:
             plt.title('Training Progress')
             plt.annotate(f"hidden_dims={self.model.hidden_dims}\nscheduler={self.scheduler}\nN={len(train_dataset)}\nleak={self.model.leak}", xy=(0.5, 0.5), xycoords='axes fraction', fontsize=12, ha='center', va='center', bbox=dict(boxstyle="round,pad=0.3", edgecolor='black', facecolor='lightgray'))
             plt.show()
-            
+    @staticmethod
+    def get_device() -> str:
+        
+        # Check for available devices in order of preference: MPS, CUDA, CPU
+        if torch.backends.mps.is_available():
+            return 'mps'
+        elif torch.cuda.is_available():
+            return 'cuda'
+        else:
+            return 'cpu'
     
+
+
+
     def predict(self, voltages: np.ndarray,require_grad: bool = False):
         """Predict values for given voltages"""
         self.model.eval()
@@ -361,24 +365,28 @@ class ElectronOpticsPredictor:
             'scaler_voltages': self.scaler_voltages,
             'scaler_values': self.scaler_values,
             'input_dim': self.input_dim,
-            'output_dim': self.output_dim
+            'output_dim': self.output_dim,
+            'leak': self.model.leak
         }, filepath)
-    
-    def load_model(self, filepath: str):
+    @classmethod
+    def load_model(cls, filepath: str,device: str = None):
         """Load a trained model"""
-        checkpoint = torch.load(filepath, map_location=self.device)
+        if device is None:
+            device=cls.get_device()
+        checkpoint = torch.load(filepath, map_location=torch.device(device))
         
         # Create model with correct input/output dimensions
-        self.input_dim = checkpoint['input_dim']
-        self.output_dim = checkpoint.get('output_dim', 1)  # Default to 1 for backward compatibility
+        input_dim = checkpoint['input_dim']
+        output_dim = checkpoint.get('output_dim', 1)  # Default to 1 for backward compatibility
         
         # Recreate model with proper dimensions
-        self.model = ElectronOpticsModel(self.input_dim, self.output_dim).to(self.device)
-        
+        predictor= cls(input_dim=input_dim, output_dim=output_dim, device=device, leak=checkpoint.get('leak', 0.0))
         # Load state and scalers
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.scaler_voltages = checkpoint['scaler_voltages']
-        self.scaler_values = checkpoint.get('scaler_values')
+        predictor.model.load_state_dict(checkpoint['model_state_dict'])
+        predictor.scaler_voltages = checkpoint['scaler_voltages']
+        predictor.scaler_values = checkpoint.get('scaler_values')
+
+        return predictor
 
 
 def optimize_voltages(   predictors:list[ElectronOpticsPredictor]= None,
@@ -437,7 +445,7 @@ def optimize_voltages(   predictors:list[ElectronOpticsPredictor]= None,
             if voltage_bounds is not None:
                 voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1])
             else:
-                voltages = np.random.uniform(-1, 1, size=predictors[0].input_dim)
+                voltages = np.random.uniform(predictors[0].scaler_voltages["min"], predictors[0].scaler_voltages["max"], size=predictors[0].input_dim)
             
             # Normalize initial voltages
             
