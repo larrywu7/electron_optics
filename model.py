@@ -432,118 +432,118 @@ def optimize_voltages(   predictors:list[ElectronOpticsPredictor]= None,
                          random_restarts: int = 5,
                          voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                          constrain_to_training_range: bool = False):
-        """Find voltages that optimize the predicted values according to a custom objective
-        
-        Args:
-            objective_function: Custom function that takes the model prediction tensor and returns a scalar to maximize
-                                Example: lambda pred: pred[:, 0] - 0.5 * pred[:, 1]
-            value_index: Index of the value to optimize if optimizing a single output
-            weights: Weights for each output value for weighted optimization; 
-                     positive for maximization, negative for minimization
-            n_iterations: Number of optimization iterations
-            learning_rate: Learning rate for optimization
-            random_restarts: Number of random starting points to try
-            voltage_bounds: Tuple of (min_voltages, max_voltages) to constrain optimization
-            constrain_to_training_range: If True, constrains voltages to the range seen during training.
-                                         If False, allows exploration beyond training data range.
-
-
-        Returns:
-            best_voltages: Optimal voltage settings
-            best_values: Predicted values at the optimal voltage settings
-            best_objective: Value of the objective function at the optimal point
-        """
-        if predictors is None or len(predictors) == 0:
-            raise ValueError("At least one ElectronOpticsPredictor instance must be provided.")
-        best_voltages = None
-        best_values = None
-        best_objective = float('-inf')
-        device = predictors[0].device
+    """Find voltages that optimize the predicted values according to a custom objective
     
-        # Define the objective function
-        if objective_function is None:
-            if weights is not None:
-                # Weighted sum of values
-                def objective_func(pred):
-                    return torch.sum(pred * torch.tensor(weights, device=device, dtype=torch.float32))
-            else:
-                # Maximize single value
-                def objective_func(pred):
-                    return pred[:, value_index]
+    Args:
+        objective_function: Custom function that takes the model prediction tensor and returns a scalar to maximize
+                            Example: lambda pred: pred[:, 0] - 0.5 * pred[:, 1]
+        value_index: Index of the value to optimize if optimizing a single output
+        weights: Weights for each output value for weighted optimization; 
+                    positive for maximization, negative for minimization
+        n_iterations: Number of optimization iterations
+        learning_rate: Learning rate for optimization
+        random_restarts: Number of random starting points to try
+        voltage_bounds: Tuple of (min_voltages, max_voltages) to constrain optimization
+        constrain_to_training_range: If True, constrains voltages to the range seen during training.
+                                        If False, allows exploration beyond training data range.
+
+
+    Returns:
+        best_voltages: Optimal voltage settings
+        best_values: Predicted values at the optimal voltage settings
+        best_objective: Value of the objective function at the optimal point
+    """
+    if predictors is None or len(predictors) == 0:
+        raise ValueError("At least one ElectronOpticsPredictor instance must be provided.")
+    best_voltages = None
+    best_values = None
+    best_objective = float('-inf')
+    device = predictors[0].device
+
+    # Define the objective function
+    if objective_function is None:
+        if weights is not None:
+            # Weighted sum of values
+            def objective_func(pred):
+                return torch.sum(pred * torch.tensor(weights, device=device, dtype=torch.float32))
         else:
-            # Use the provided custom objective function
-            objective_func = objective_function
+            # Maximize single value
+            def objective_func(pred):
+                return pred[:, value_index]
+    else:
+        # Use the provided custom objective function
+        objective_func = objective_function
+    plt.figure(figsize=(10, 5))
+    for restart in range(random_restarts):
+        losses=[]
+        # Initialize voltages
+        if voltage_bounds is not None:
+            voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1])
+        else:
+            voltages = np.random.uniform(predictors[0].scaler_voltages["min"], predictors[0].scaler_voltages["max"], size=predictors[0].input_dim)
         
-        for restart in range(random_restarts):
-            losses=[]
-            # Initialize voltages
-            if voltage_bounds is not None:
-                voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1])
-            else:
-                voltages = np.random.uniform(predictors[0].scaler_voltages["min"], predictors[0].scaler_voltages["max"], size=predictors[0].input_dim)
-            
-            # Normalize initial voltages
-            
-            voltages = voltages.flatten()
-            
-            # Convert to tensor and require gradients
-            voltages_tensor = torch.FloatTensor(voltages).to(device)
-            voltages_tensor.requires_grad_(True)
-            
-            optimizer = optim.Adam([voltages_tensor], lr=learning_rate)
-            
-            for iteration in range(n_iterations):
-                optimizer.zero_grad()
-                
-                # Predict values
-                predictions=torch.empty(0, dtype=torch.float32, device=device)
-              
-                for predictor in predictors:
-
-                    prediction = predictor.predict(voltages_tensor.unsqueeze(0)[:, :predictor.input_dim], require_grad=True)
-                    prediction =torch.Tensor(prediction).squeeze(0).to(device)
-                    predictions = torch.cat((predictions, prediction), dim=0)
-                    
-                predictions = predictions.to(device)
-
-                
-               
-                
-                    
-                # Compute objective (negative for maximization)
-                loss = objective_func(predictions)
-                losses.append(loss.item())
-                loss.backward()
-                optimizer.step()
-                
-                # Optionally constrain to training range
-                if constrain_to_training_range:
-                    with torch.no_grad():
-                        voltages_tensor.clamp_(0, 1)
-            plt.figure(figsize=(10, 5))
-            plt.plot(losses, label=f'Train Loss (Restart {restart+1})')
-            plt.xlabel('iteration')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.yscale('log')
-            plt.title('Voltage Optimization Progress')
-            plt.show()
-            # Get final result
-            with torch.no_grad():
-                final_predictions=torch.empty(0, dtype=torch.float32, device=device)
-                for predictor in predictors:
-                    final_prediction = predictor.predict(voltages_tensor.unsqueeze(0),require_grad=True)
-                    final_predictions = torch.cat((final_predictions, final_prediction), dim=0)
-                final_predictions = final_predictions.to(device)
-               
-                final_objective = objective_func(final_predictions).item()
-                
-                if final_objective > best_objective:
-                    best_objective = final_objective
-                    best_voltages = voltages_tensor.cpu().numpy()
-                    best_values = final_predictions
+        # Normalize initial voltages
         
-        return best_voltages, best_values, best_objective #best_values is best predicted output_values and best_objective is best metric value. 
+        voltages = voltages.flatten()
+        
+        # Convert to tensor and require gradients
+        voltages_tensor = torch.FloatTensor(voltages).to(device)
+        voltages_tensor.requires_grad_(True)
+        
+        optimizer = optim.Adam([voltages_tensor], lr=learning_rate)
+        
+        for iteration in range(n_iterations):
+            optimizer.zero_grad()
+            
+            # Predict values
+            predictions=torch.empty(0, dtype=torch.float32, device=device)
+            
+            for predictor in predictors:
+
+                prediction = predictor.predict(voltages_tensor.unsqueeze(0)[:, :predictor.input_dim], require_grad=True)
+                prediction =torch.Tensor(prediction).squeeze(0).to(device)
+                predictions = torch.cat((predictions, prediction), dim=0)
+                
+            predictions = predictions.to(device)
+
+            
+            
+            
+                
+            # Compute objective (negative for maximization)
+            loss = objective_func(predictions)
+            losses.append(loss.item())
+            loss.backward()
+            optimizer.step()
+            
+            # Optionally constrain to training range
+            if constrain_to_training_range:
+                with torch.no_grad():
+                    voltages_tensor.clamp_(0, 1)
+        
+        plt.plot(losses, label=f'Train Loss (Restart {restart+1})')
+    
+        # Get final result
+        with torch.no_grad():
+            final_predictions=torch.empty(0, dtype=torch.float32, device=device)
+            for predictor in predictors:
+                final_prediction = predictor.predict(voltages_tensor.unsqueeze(0),require_grad=True)
+                final_predictions = torch.cat((final_predictions, final_prediction), dim=0)
+            final_predictions = final_predictions.to(device)
+            
+            final_objective = objective_func(final_predictions).item()
+            
+            if final_objective > best_objective:
+                best_objective = final_objective
+                best_voltages = voltages_tensor.cpu().numpy()
+                best_values = final_predictions
+    plt.xlabel('iteration')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.yscale('log')
+    plt.title('Voltage Optimization Progress')
+    plt.show()
+    return best_voltages, best_values, best_objective #best_values is best predicted output_values and best_objective is best metric value. 
 
 
 
