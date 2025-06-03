@@ -1,6 +1,7 @@
+import random
 import pandas as pd
 import numpy as np
-from typing import Union
+from typing import Union, Callable
 
 
 def load_data(
@@ -71,3 +72,67 @@ def trim_outliers(
     outlier_outputs = raw_outputs[outlier_mask]
 
     return voltages, outputs, outlier_voltages, outlier_outputs
+
+
+def uniform_metric_distribution(
+    voltages: np.ndarray,
+    outputs: np.ndarray,
+    metric: Callable[[np.ndarray], np.ndarray],
+    n_bins: int = 7,
+    max_metric: float = 600.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prune input voltages and outputs such that the resultant distribution of metrics,
+    `metric(outputs)`, is uniform. The number of resultant data points is the product of
+    `n_bins` and the length of the smallest bin.
+
+    Args
+    ----
+    voltages: np.ndarray
+        raw set of voltages used to generate `outputs`
+    outputs: np.ndarray
+        raw simulation output data; must have the same length as voltages
+    metric: Callable[[np.ndarray], np.ndarray]
+        function which takes `outputs` as its sole argument and returns a vector with
+        scalar values for each output
+    n_bins: int
+        number of bins used to digitize metrics prior to uniform sampling
+    max_metric: float
+        maximum metric considered in digitization. The raw metric distribution is
+        typically very positively skewed. You'll want to ignore large values or most of
+        the data will go into the smallest bin.
+
+    Returns
+    -------
+    uniform_voltages: np.ndarray
+        random sampling of provided voltages such that the associated outputs produce a
+        uniform set of metrics
+    uniform_outputs: np.ndarray
+        random sampling of provided outputs such that `metric(uniform_outputs)` is a
+        uniform distribution
+    """
+    assert (
+        outputs.shape[0] == voltages.shape[0]
+    ), "voltages and outputs have different lengths"
+
+    metrics = metric(outputs)
+    bin_edges = np.linspace(metrics.min(), max_metric, n_bins)
+    indices = np.digitize(metrics, bin_edges)
+
+    voltages_list: list = voltages.tolist()
+    outputs_list: list = outputs.tolist()
+    uniform_voltages = []
+    uniform_outputs = []
+    bin_empty = False
+    while not bin_empty:
+        for i in range(1, n_bins + 1):
+            matches = np.where(indices == i)[0]
+            if matches.size == 0:
+                bin_empty = True
+            else:
+                random_match = random.choice(matches)
+
+                indices = np.delete(indices, random_match)
+                uniform_voltages.append(voltages_list.pop(random_match))
+                uniform_outputs.append(outputs_list.pop(random_match))
+
+    return np.array(uniform_voltages), np.array(uniform_outputs)
