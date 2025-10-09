@@ -22,7 +22,8 @@ def run_inference(
     if predictor is None:
         raise ValueError("Predictor instance must be provided for inference.")
 
-    dataset = predictor.train_ds if use_training_ds else predictor.val_ds
+    dataset = predictor.train_ds_norm if use_training_ds else predictor.val_ds_norm
+
     ds_loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     # Run inference on validation loader
@@ -52,7 +53,7 @@ def run_inference(
 
 
 def plot_inference_comparison(
-    predictor,
+    predictor: ElectronOpticsPredictor,
     n_samples: int = None,
     subplot_shape: Tuple[int, ...] = (3, 5),
     figsize=(20, 10),
@@ -84,6 +85,7 @@ def plot_inference_comparison(
         ax[v].legend()
 
     plt.tight_layout()
+    plt.show()
     return fig, ax, all_predictions, all_true_values
 
 
@@ -190,6 +192,7 @@ def trim_hist(
             ax[v + n_voltage_channels].legend()
 
     plt.tight_layout()
+    plt.show()
 
     # Calculate and print retention percentage
     retention_pct = (output_values.shape[0] / output_values_unclean.shape[0]) * 100
@@ -297,6 +300,7 @@ def trim_scatter(
         # ax[v].axhline(np.mean(output_values[v], axis=0)-trim_threshold[v]*np.std(output_values, axis=0)[v], color='red', linestyle='--', linewidth=1)
 
     plt.tight_layout()
+    plt.show()
 
     return fig, ax, voltages, output_values, voltages_masked, output_values_masked
 
@@ -322,3 +326,34 @@ def denormalize_data(normalized_data: np.ndarray, scaler: Dict[str, np.ndarray])
 
     denormalized = normalized_data * range_vals + scaler["min"]
     return denormalized
+
+def sigmoid_transform(u: torch.Tensor, vmin: float, vmax: float, tau: float = 1.0) -> torch.Tensor:
+    """
+    Map unconstrained u ∈ R^d to [vmin, vmax] using a scaled sigmoid.
+
+    Args:
+        u     : unconstrained tensor
+        vmin  : tensor of lower bounds (broadcastable to u)
+        vmax  : tensor of upper bounds (broadcastable to u)
+        tau   : temperature (default 1.0). Larger = gentler sigmoid.
+
+    Returns:
+        v in [vmin, vmax]
+    """
+    alpha = torch.sigmoid((u-(vmax-vmin)/2) / tau)  # in (0,1)
+    return vmin + (vmax - vmin) * alpha
+def tanh_transform(u, a, b, s , eps=1e-6):
+    """
+    Smoothly clamp u to [a, b] while being identity near the midpoint.
+    a, b, u can be scalars or tensors (broadcastable).
+    """
+    a = torch.as_tensor(a, dtype=u.dtype, device=u.device)
+    b = torch.as_tensor(b, dtype=u.dtype, device=u.device)
+    m = (a + b) / 2
+    # keep a small margin eps to avoid saturating exactly at the boundary
+    s = (b - a) / 2 - eps
+    # ensure s > 0 (if a==b, just return the midpoint)
+    s = torch.clamp(s, min=eps)
+    return m + s * torch.tanh((u - m) / s)
+def l2(gs):
+    return torch.sqrt(sum((g**2).sum() for g in gs if g is not None) + 1e-12)

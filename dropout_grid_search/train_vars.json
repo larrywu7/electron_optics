@@ -1,0 +1,48 @@
+{   
+
+
+"predictor1": {
+    "n_voltages": 14,
+    "n_output_values": 2,
+    "output_values_start": 14,
+    "output_values_end": 15,
+    "leak": 0.2,
+    "data_trimming": {
+    "trim_mode": "iqr",
+    "threshold": 4
+  }
+
+  },
+"predictor2": {
+    "n_voltages": 14,
+    "n_output_values": 4,
+    "output_values_start": 16,
+    "output_values_end": 19,
+    "leak": 0.2,
+    "data_trimming": {
+    "trim_mode": "iqr",
+    "threshold": 4}
+
+  },
+"predictor3": {
+    "n_voltages": 14,
+    "n_output_values": 2,
+    "output_values_start": 20,
+    "output_values_end": 21,
+    "leak": 0.2,
+    "data_trimming": {
+    "trim_mode": "iqr",
+    "threshold": 4}
+  },
+"predictor4": {
+    "n_voltages": 14,
+    "n_output_values": 4,
+    "output_values_start": 22,
+    "output_values_end": 25,
+    "leak": 0.2,
+    "data_trimming": {
+    "trim_mode": "iqr",
+    "threshold": 4}
+
+  }
+}
