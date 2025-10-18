@@ -47,6 +47,7 @@ class ElectronOpticsModel(nn.Module):
         super(ElectronOpticsModel, self).__init__()
         self.hidden_dims = hidden_dims
         self.dropout = dropout
+        self.leak = leak
         # Build the network
         layers = []
         prev_dim = input_dim
@@ -64,12 +65,44 @@ class ElectronOpticsModel(nn.Module):
 
         # Output layer (vector output)
         layers.append(nn.Linear(prev_dim, output_dim))
-        self.leak = leak
+        
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.network(x)
 
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim, leak=0.2, dropout=0.2):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
+            nn.LeakyReLU(leak),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim=14, output_dim=12, hidden_dims=64, leak=0.2, dropout=0.2, num_blocks=3):
+        super().__init__()
+        self.dropout = dropout
+        self.leak = leak
+        self.hidden_dims = hidden_dims
+        self.input = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims),
+            nn.LeakyReLU(leak)
+        )
+        self.blocks = nn.Sequential(*[_ResidualBlock(hidden_dims, leak=leak, dropout=dropout) for _ in range(num_blocks)])
+        self.output = nn.Linear(hidden_dims, output_dim)
+        
+    def forward(self, x):
+        x = self.input(x)
+        x = self.blocks(x)
+        return self.output(x)
 
 class ElectronOpticsPredictor:
     """Main class for training and using the electron optics prediction model"""
@@ -81,13 +114,18 @@ class ElectronOpticsPredictor:
         device: Optional[str] = None,
         leak: float = 0.0,
         dropout: float = 0.2,
+        model=ElectronOpticsModel,
+        **kwargs
     ):
         device = self.get_device() if device is None else device
         self.device = torch.device(device)
         self.dropout = dropout
-        self.model = ElectronOpticsModel(input_dim, output_dim, leak=leak, dropout=self.dropout).to(
-            self.device
-        )
+        if model==ElectronOpticsModel:
+            self.model = model(input_dim, output_dim, leak=leak, dropout=dropout, **kwargs).to(
+                self.device
+            )
+        else:
+            self.model = model(input_dim, output_dim, leak=leak, dropout=dropout, **kwargs).to(self.device)
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.scaler_voltages = None
@@ -96,6 +134,7 @@ class ElectronOpticsPredictor:
         self.validation_ds = None
         self.train_losses = []
         self.val_losses = []
+        self.optimization_iter = 0
 
         print(f"Using device: {self.device}")
 
@@ -219,10 +258,9 @@ class ElectronOpticsPredictor:
             for batch_voltages, batch_values in train_loader:
                 batch_voltages = batch_voltages.to(self.device)
                 batch_values = batch_values.to(self.device)
-
-                optimizer.zero_grad()
                 outputs = self.model(batch_voltages)
                 loss: torch.Tensor = criterion(outputs, batch_values)
+                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
@@ -265,7 +303,6 @@ class ElectronOpticsPredictor:
                 print(
                     f"Epoch {epoch}: Train Loss = {train_loss:.6f}, Val Loss = {val_loss:.6f}"
                 )
-
         # Load best model
         self.model.load_state_dict(torch.load(checkpoint_name)['model_state_dict'])
 
@@ -309,7 +346,7 @@ class ElectronOpticsPredictor:
         self,
         voltages: Union[np.ndarray, torch.Tensor],
         require_grad: bool = False,
-        as_numpy: bool = True,  # ← return NumPy by default for inference
+        device: Optional[str] = None  # ← return NumPy by default for inference
     ):
         """
         If `require_grad=True`, returns a **torch.Tensor** on the same device
@@ -319,26 +356,28 @@ class ElectronOpticsPredictor:
         self.model.eval()
 
         # -------- 1. Convert input to a tensor on the right device ----------
+        if device is None:
+            device = self.device
         if isinstance(voltages, np.ndarray):
             voltages_tensor = torch.as_tensor(
-                voltages, dtype=torch.float32, device=self.device
+                voltages, dtype=torch.float32, device=device
             )
         else:
-            voltages_tensor = voltages.to(self.device, dtype=torch.float32)
+            voltages_tensor = voltages.to(device, dtype=torch.float32)
 
         voltages_tensor = voltages_tensor.flatten()
 
         # -------- 2. Normalise (pure-torch math so graph is intact) ---------
         vmean = torch.as_tensor(
-            self.scaler_voltages["mean"], dtype=torch.float32, device=self.device
+            self.scaler_voltages["mean"], dtype=torch.float32, device=device
         )
         vstd = torch.as_tensor(
-            self.scaler_voltages["std"], dtype=torch.float32, device=self.device
+            self.scaler_voltages["std"], dtype=torch.float32, device=device
         )
         voltages_norm = (voltages_tensor - vmean) / vstd
 
         voltages_norm.requires_grad_(require_grad)
-
+        self.model.to(device)
         # -------- 3. Forward pass ------------------------------------------
         with torch.set_grad_enabled(require_grad):
             preds_norm: torch.Tensor = self.model(
@@ -348,10 +387,10 @@ class ElectronOpticsPredictor:
             # denormalise **in torch**
             if self.scaler_values is not None:
                 smean = torch.as_tensor(
-                    self.scaler_values["mean"], dtype=torch.float32, device=self.device
+                    self.scaler_values["mean"], dtype=torch.float32, device=device
                 )
                 sstd = torch.as_tensor(
-                    self.scaler_values["std"], dtype=torch.float32, device=self.device
+                    self.scaler_values["std"], dtype=torch.float32, device=device
                 )
                 preds = preds_norm * sstd + smean
             else:
@@ -360,53 +399,9 @@ class ElectronOpticsPredictor:
         preds = preds.squeeze(0)  # shape (n_out,)
 
         # -------- 4. Decide return type ------------------------------------
-        if require_grad or not as_numpy:
-            return preds  # torch.Tensor with grad_fn (if any)
-        else:
-            return preds.detach().cpu().numpy()
-
-    def optimize_voltages(
-        self,
-        objective_function: Callable = None,
-        value_index: int = 0,
-        weights: list = None,
-        n_iterations: int = 1000,
-        learning_rate: float = 0.1,
-        random_restarts: int = 5,
-        voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        constrain_to_training_range: bool = False,
-    ):
-        """Find voltages that optimize the predicted values according to a custom objective
-
-        Args:
-            objective_function: Custom function that takes the model prediction tensor and returns a scalar to maximize
-                                Example: lambda pred: pred[:, 0] - 0.5 * pred[:, 1]
-            value_index: Index of the value to optimize if optimizing a single output
-            weights: Weights for each output value for weighted optimization;
-                     positive for maximization, negative for minimization
-            n_iterations: Number of optimization iterations
-            learning_rate: Learning rate for optimization
-            random_restarts: Number of random starting points to try
-            voltage_bounds: Tuple of (min_voltages, max_voltages) to constrain optimization
-            constrain_to_training_range: If True, constrains voltages to the range seen during training.
-                                         If False, allows exploration beyond training data range.
-
-        Returns:
-            best_voltages: Optimal voltage settings
-            best_values: Predicted values at the optimal voltage settings
-            best_objective: Value of the objective function at the optimal point
-        """
-        return optimize_voltages(
-            [self],
-            objective_function,
-            value_index,
-            weights,
-            n_iterations,
-            learning_rate,
-            random_restarts,
-            voltage_bounds,
-            constrain_to_training_range,
-        )
+        
+        return preds  # torch.Tensor with grad_fn (if any)
+        
 
     def save_model(self, filepath: str):
         """Save the trained model"""
@@ -417,6 +412,7 @@ class ElectronOpticsPredictor:
                 "scaler_values": self.scaler_values,
                 "input_dim": self.input_dim,
                 "output_dim": self.output_dim,
+                "hidden_dims": self.model.hidden_dims,
                 "leak": self.model.leak,
                 "dropout": self.model.dropout,
                 "train_ds": self.train_ds,
@@ -451,6 +447,7 @@ class ElectronOpticsPredictor:
         predictor.scaler_values   = checkpoint["scaler_values"]
         predictor.input_dim       = checkpoint["input_dim"]
         predictor.output_dim      = checkpoint["output_dim"]
+        predictor.model.hidden_dims = checkpoint["hidden_dims"]
         predictor.model.leak      = checkpoint["leak"]
         predictor.model.dropout   = checkpoint["dropout"]
         predictor.train_ds        = checkpoint["train_ds"]
@@ -459,6 +456,7 @@ class ElectronOpticsPredictor:
         predictor.val_ds_norm     = checkpoint["val_ds_norm"]
         predictor.train_losses    = checkpoint.get("train_losses", [])
         predictor.val_losses      = checkpoint.get("val_losses", [])
+        
         return predictor
 
 
@@ -471,8 +469,9 @@ def optimize_voltages(
     learning_rate: float = 0.1,
     random_restarts: int = 5,
     voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    clamp: bool = False,
     hyperparameters: dict = {'strength': 0, 'min': float('-inf'), 'max': float('inf'), 's': 100000},
+    device= None,
+    clamp: bool = False,
 ):
     """Find voltages that optimize the predicted values according to a custom objective
 
@@ -498,7 +497,7 @@ def optimize_voltages(
     best_voltages = None
     best_values = None
     best_objective = float("inf")
-    device = predictors[0].device
+    device = predictors[0].device if device is None else device
 
     # Define the objective function
     if objective_function is None:
@@ -545,7 +544,7 @@ def optimize_voltages(
         optimizer = optim.Adam([voltages_tensor], lr=learning_rate)
 
         for iteration in range(n_iterations):
-            optimizer.zero_grad()
+            
 
             # Predict values
             predictions = torch.empty(0, dtype=torch.float32, device=device)
@@ -562,13 +561,13 @@ def optimize_voltages(
 
             strength, a, b, s = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max'], hyperparameters['s']
             u = tanh_transform(voltages_tensor, a, b, s)  # apply sigmoid transform so that the voltages stay within [a,b]
-            regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum() if strength != 0 else 0
+            regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum()
 
             # Compute loss 
 
-            metric_value = (objective_func(predictions))
+            metric_value = (objective_func(predictions)).to(device)
             loss =  metric_value + regularizing_term
-
+            
             losses.append((loss).item())
             metric_values.append(metric_value.item())
             regularizer_values.append(regularizing_term.item())
@@ -578,8 +577,10 @@ def optimize_voltages(
                 gr = torch.autograd.grad(regularizing_term, voltages_tensor, retain_graph=True, allow_unused=True)
                 rho = (l2(gr) / (l2(gt) + 1e-12)).item()
                 rhos.append(rho)
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
 
             # Optionally constrain to training range
             if clamp:
@@ -612,7 +613,7 @@ def optimize_voltages(
             final_predictions = torch.empty((0,), dtype=torch.float32, device=device)
             for predictor in predictors:
                 final_prediction = predictor.predict(
-                    voltages_tensor.unsqueeze(0), require_grad=True
+                    voltages_tensor.unsqueeze(0), require_grad=False, device=device
                 )
                 final_predictions = torch.cat(
                     (final_predictions, final_prediction), dim=0
@@ -632,6 +633,216 @@ def optimize_voltages(
         best_objective,
     )  # best_values is best predicted output_values and best_objective is best metric value.
 
+def optimize_voltages_gradnorm(
+    predictors: list[ElectronOpticsPredictor],
+    objective_function: Optional[Callable] = None,
+    value_index: int = 0,
+    weights: list = None,
+    n_iterations: int = 1000,
+    learning_rate: float = 1e-5,
+    learning_rate_weights: float = 5e-4,
+    random_restarts: int = 5,
+    voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    hyperparameters: dict = {'strength': 0, 'min': float('-inf'), 'max': float('inf'), 's': 100000, 'alpha': 0.12},
+    device='cpu',
+    clamp: bool = False,
+):
+    """Find voltages that optimize the predicted values according to a custom objective
+
+    Args:
+        objective_function: Custom function that takes the model prediction tensor and returns a scalar to maximize
+                            Example: lambda pred: pred[:, 0] - 0.5 * pred[:, 1]
+        value_index: Index of the value to optimize if optimizing a single output
+        weights: Weights for each output value for weighted optimization;
+                    positive for maximization, negative for minimization
+        n_iterations: Number of optimization iterations
+        learning_rate: Learning rate for optimization
+        random_restarts: Number of random starting points to try
+        voltage_bounds: Tuple of (min_voltages, max_voltages) to constrain optimization
+        constrain_to_training_range: If True, constrains voltages to the range seen during training.
+                                        If False, allows exploration beyond training data range.
+
+
+    Returns:
+        best_voltages: Optimal voltage settings
+        best_values: Predicted values at the optimal voltage settings
+        best_objective: Value of the objective function at the optimal point
+    """
+    
+    best_voltages = None
+    best_values = None
+    best_objective = float("inf")
+    fig,ax = plt.subplots(random_restarts,2,figsize=(8,20))
+    # Define the objective function
+    if objective_function is None:
+        if weights is not None:
+            # Weighted sum of values
+            def objective_func(pred):
+                return torch.sum(
+                    pred * torch.tensor(weights, device=device, dtype=torch.float32)
+                )
+
+        else:
+            # Maximize single value
+            def objective_func(pred):
+                return pred[:, value_index]
+
+    else:
+        # Use the provided custom objective function
+        objective_func = objective_function
+
+    restart_results = []
+    for restart in range(random_restarts):
+        losses = []
+        metric_values = []
+        regularizer_values = []
+        rhos = []
+        # Initialize voltages
+        if voltage_bounds is not None:
+            voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1],size=predictors[0].input_dim)
+        else:
+            voltages = np.random.uniform(
+
+                np.min(predictors[0].train_ds.voltages.numpy(), axis=0),
+                np.max(predictors[0].train_ds.voltages.numpy(), axis=0),
+                size=predictors[0].input_dim,
+            )
+
+        # Normalize initial voltages
+
+        voltages = voltages.flatten()
+
+        # Convert to tensor and require gradients
+        voltages_tensor = torch.FloatTensor(voltages).to(device)
+        voltages_tensor.requires_grad_(True)
+        
+
+        optimizer = optim.Adam([voltages_tensor], lr=learning_rate)
+
+
+
+        log_weights = []
+        log_loss = []
+        for iteration in range(n_iterations):
+            
+
+            # Predict values
+            predictions = torch.empty(0, dtype=torch.float32, device=device)
+
+            for predictor in predictors:
+                prediction = predictor.predict(
+                    voltages_tensor.unsqueeze(0)[:, : predictor.input_dim],
+                    require_grad=True,device=device
+                )
+                prediction = torch.Tensor(prediction).squeeze(0).to(device)
+                predictions = torch.cat((predictions, prediction), dim=0)
+
+            predictions = predictions.to(device)
+            if hyperparameters['strength'] != 0:
+                strength, a, b, s = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max'], hyperparameters['s']
+                u = tanh_transform(voltages_tensor, a, b, s,device=device)  # apply sigmoid transform so that the voltages stay within [a,b]
+                regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum()
+
+            # Compute loss 
+
+            metric_values = objective_func(predictions,device=device)
+            loss =torch.cat((*metric_values, regularizing_term.unsqueeze(0)), dim=0) if hyperparameters['strength'] != 0 else torch.cat(metric_values, dim=0)
+            if iteration == 0:
+                weights = torch.ones_like(loss)
+                weights = torch.nn.Parameter(weights)
+                T=weights.sum().detach()
+                optimizer_weights = torch.optim.Adam([weights], lr=learning_rate_weights)
+                l0=loss.detach()
+            weighted_loss = weights @ loss
+            optimizer.zero_grad()
+            weighted_loss.backward(retain_graph=True)
+
+            gw=[]
+            for i in range(len(loss)):
+                dl = torch.autograd.grad(weights[i] * loss[i], voltages_tensor, retain_graph=True, create_graph=True)[0]
+
+                gw.append(torch.norm(dl))
+                
+            gw = torch.stack(gw)
+
+            loss_ratio = loss.detach()/l0
+            
+            rt=loss_ratio / loss_ratio.mean()
+            
+            gw_avg =gw.mean().detach()
+            alpha = hyperparameters['alpha']
+            constant = (gw_avg * rt **alpha).detach()
+            gradnorm_loss = torch.abs(gw - constant).sum()
+            optimizer_weights.zero_grad()
+            gradnorm_loss.backward()
+            log_weights.append(weights.detach().cpu().numpy().copy())
+            log_loss.append(loss_ratio.detach().cpu().numpy().copy())
+            optimizer.step()
+            optimizer_weights.step()
+            if clamp:
+                with torch.no_grad():
+                    if voltage_bounds is not None:
+                        voltages_tensor.clamp_(
+                            torch.tensor(voltage_bounds[0], device=device, dtype=torch.float32),
+                            torch.tensor(voltage_bounds[1], device=device, dtype=torch.float32)
+                        )
+                    else:
+                        voltages_tensor.clamp_(np.min(predictors[0].train_ds.voltages.numpy()), np.max(predictors[0].train_ds.voltages.numpy()))
+
+
+
+
+
+            weights =(weights / weights.sum() * T).detach()
+            weights = torch.nn.Parameter(weights)
+            
+            optimizer_weights = torch.optim.Adam([weights], lr=0.01)
+
+            
+
+
+        log_weights = np.array(log_weights).T
+        log_loss = np.array(log_loss).T
+        
+        for i in range(log_weights.shape[0]):
+            ax[restart, 0].plot(log_weights[i], label=f"weight {i} (Restart {restart+1})")
+            ax[restart, 1].plot(log_loss[i], label=f"loss (Restart {restart+1}, part {i})")
+        ax[restart, 0].legend()
+        ax[restart, 1].legend()
+        ax[restart, 0].set_yscale("log")
+        ax[restart, 1].set_yscale("log")
+        ax[restart, 0].set_xlabel("iteration")
+        ax[restart, 1].set_xlabel("iteration")
+        ax[restart, 0].set_ylabel("Weights")
+        ax[restart, 1].set_ylabel("Loss")
+        ax[restart, 0].set_title(f"Voltage Optimization Progress (Restart {restart+1})")
+        ax[restart, 1].set_title(f"Voltage Optimization Progress (Restart {restart+1})")
+        plt.tight_layout()
+        # Get final result
+        with torch.no_grad():
+            final_predictions = torch.empty((0,), dtype=torch.float32, device=device)
+            for predictor in predictors:
+                final_prediction = predictor.predict(
+                    voltages_tensor.unsqueeze(0)[:, : predictor.input_dim], require_grad=False, device=device
+                )
+                final_predictions = torch.cat(
+                    (final_predictions, final_prediction), dim=0
+                )
+            final_predictions = final_predictions.to(device)
+
+            final_objective = (torch.stack(objective_func(final_predictions)).sum()).item()
+            restart_result={"voltages": voltages_tensor, "objective": final_objective}
+            restart_results.append(restart_result)
+            if final_objective < best_objective:
+                best_objective = final_objective
+                best_voltages = voltages_tensor.cpu().numpy()
+                best_values = final_predictions
+    print(f'Restart {restart+1}, best objective: {best_objective}')
+    return (
+        best_voltages,
+        best_values,
+        best_objective,
+    ), restart_results, (np.stack(log_weights), np.stack(log_loss))  # best_values is best predicted output_values and best_objective is best metric value.
 
 
 
@@ -649,9 +860,14 @@ DET_D = torch.tensor(25.0, device=device, dtype=dtype)
 
 
 # ---------- all-torch versions ----------
-def angle_resolved_aper0(aper0_map: torch.Tensor) -> torch.Tensor:
+def angle_resolved_aper0(aper0_map: torch.Tensor,device=torch.device("cpu")) -> torch.Tensor:
     """aper0_map shape: (6,) tensor on *any* device"""
     aper0_map = aper0_map.to(device)  # move to same GPU/CPU
+    APER_0_D = torch.tensor(0.5, device=device, dtype=dtype)
+    solid_angle_scaling = torch.tensor(
+        math.sin(math.radians(5 / 2)) / math.sin(math.radians(60 / 2)),
+        device=device, dtype=dtype,
+    )
     aberr = (
         aper0_map[0] ** 2
         + aper0_map[2] ** 2
@@ -663,9 +879,14 @@ def angle_resolved_aper0(aper0_map: torch.Tensor) -> torch.Tensor:
     return aberr + (torch.abs(aper0_map[1] * solid_angle_scaling) - APER_0_D / 2) ** 2
 
 
-def spatial_resolved_detector(det_map: torch.Tensor) -> torch.Tensor:
+def spatial_resolved_detector(det_map: torch.Tensor, device=torch.device("cpu")) -> torch.Tensor:
     """det_map shape: (≥6,) tensor on *any* device"""
     det_map = det_map.to(device)
+    DET_D = torch.tensor(25.0, device=device, dtype=dtype)
+    solid_angle_scaling = torch.tensor(
+        math.sin(math.radians(5 / 2)) / math.sin(math.radians(60 / 2)),
+        device=device, dtype=dtype,
+    )
     aberr = (
         (det_map[1] * solid_angle_scaling) ** 2
         + det_map[2] ** 2
@@ -679,9 +900,15 @@ def spatial_resolved_detector(det_map: torch.Tensor) -> torch.Tensor:
 
 def metric(output: torch.Tensor) -> torch.Tensor:
     """`output` is the concatenated predictor output tensor."""
-    return angle_resolved_aper0(output[:6]) * 1000 + spatial_resolved_detector(
+    return torch.stack([angle_resolved_aper0(output[:6]) * 1000 + spatial_resolved_detector(
         output[6:]
-    )
+    )])
+def metric_split(output: torch.Tensor,device= None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """`output` is the concatenated predictor output tensor."""
+    device = output.device if device is None else device
+    return angle_resolved_aper0(output[:6],device=device).unsqueeze(0), spatial_resolved_detector(
+        output[6:], device=device
+    ).unsqueeze(0)
 def objective(output: torch.Tensor, device: torch.device = None):
     device = torch.device("cpu") if device is None else device
     output.to(device)
@@ -706,61 +933,3 @@ def objective(output: torch.Tensor, device: torch.device = None):
         + angle_aberrations * angle_scaling
         + spatial_aberrations
     )
-
-"""
-n_voltages = 14     # Number of voltage parameters
-n_output_values = 2 # Number of output values (e.g., magnification, aberration, etc.)
-
-
-
-
-# Example optimization using a custom objective function
-print("\nOptimizing voltages...")
-voltage_bounds = (np.full(n_voltages, -10), np.full(n_voltages, 10))
-
-# Define a custom objective function
-# Replace this with your own function that defines what "good" means for your system
-
-# Run optimization allowing exploration beyond training range
-optimal_voltages, optimal_values, obj_value = predictor.optimize_voltages(
-    objective_function=custom_objective,
-    n_iterations=1000,
-    learning_rate=0.01,
-    random_restarts=5,
-    voltage_bounds=voltage_bounds,
-    constrain_to_training_range=False  # Allow exploration beyond training data range
-)
-
-print(f"\nOptimal voltages found (unconstrained):")
-print(f"Voltages: {optimal_voltages}")
-print(f"Predicted values: {optimal_values}")
-print(f"Objective value: {obj_value:.4f}")
-
-# Also try optimization with constraining to training range for comparison
-optimal_voltages_constrained, optimal_values_constrained, obj_value_constrained = predictor.optimize_voltages(
-    objective_function=custom_objective,
-    n_iterations=1000,
-    learning_rate=0.01,
-    random_restarts=5,
-    voltage_bounds=voltage_bounds,
-    constrain_to_training_range=True  # Constrain to training data range
-)
-
-print(f"\nOptimal voltages found (constrained to training range):")
-print(f"Voltages: {optimal_voltages_constrained}")
-print(f"Predicted values: {optimal_values_constrained}")
-print(f"Objective value: {obj_value_constrained:.4f}")
-
-# Compare the optimization results
-print("\nComparison of constrained vs. unconstrained optimization:")
-if obj_value > obj_value_constrained:
-    print(f"Unconstrained optimization found better solution (improvement: {obj_value - obj_value_constrained:.4f})")
-elif obj_value < obj_value_constrained:
-    print(f"Constrained optimization found better solution (improvement: {obj_value_constrained - obj_value:.4f})")
-else:
-    print("Both methods found the same solution.")
-
-# Save the model
-predictor.save_model('electron_optics_model.pth')
-print("\nModel saved to 'electron_optics_model.pth'")
-"""

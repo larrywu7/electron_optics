@@ -342,13 +342,15 @@ def sigmoid_transform(u: torch.Tensor, vmin: float, vmax: float, tau: float = 1.
     """
     alpha = torch.sigmoid((u-(vmax-vmin)/2) / tau)  # in (0,1)
     return vmin + (vmax - vmin) * alpha
-def tanh_transform(u, a, b, s , eps=1e-6):
+def tanh_transform(u, a, b, s , eps=1e-6, device: str=None):
     """
     Smoothly clamp u to [a, b] while being identity near the midpoint.
     a, b, u can be scalars or tensors (broadcastable).
     """
-    a = torch.as_tensor(a, dtype=u.dtype, device=u.device)
-    b = torch.as_tensor(b, dtype=u.dtype, device=u.device)
+    if device is None:
+        device = u.device
+    a = torch.as_tensor(a, dtype=u.dtype, device=device)
+    b = torch.as_tensor(b, dtype=u.dtype, device=device)
     m = (a + b) / 2
     # keep a small margin eps to avoid saturating exactly at the boundary
     s = (b - a) / 2 - eps
