@@ -89,6 +89,53 @@ def plot_inference_comparison(
     return fig, ax, all_predictions, all_true_values
 
 
+def plot_pred_vs_true(
+    predictor: ElectronOpticsPredictor,
+    n_samples: int = None,
+    subplot_shape: Tuple[int, ...] = (3, 5),
+    figsize=(20, 10),
+    **kwargs):
+    """Simple wrapper for inference plotting."""
+    all_predictions, all_true_values = run_inference(predictor, **kwargs)
+    comparison_pairs = []
+    for i in range(all_predictions.shape[1]):
+        predictions=[prediction for prediction in all_predictions[:,i]]
+        true_values=[true_value for true_value in all_true_values[:,i]]
+        comparison_pairs.append(list(zip(predictions,true_values)))
+    comparison_pairs=np.array(comparison_pairs)
+    fig, ax = plt.subplots(*subplot_shape, figsize=figsize)
+    fontsize=20
+    ax = ax.flatten()
+    n_samples = len(all_predictions) if n_samples is None else n_samples
+    for label in range(comparison_pairs.shape[0]):  # auto-detect n_output_values
+        R_squared = np.corrcoef(comparison_pairs[label,:n_samples, 0], comparison_pairs[label,:n_samples, 1])[0,1]**2
+        ax[label].text(0.05, 0.9, f"$R^2$ = {R_squared:.4f}", transform=ax[label].transAxes, fontsize=fontsize)
+        ax[label].scatter(
+            comparison_pairs[label,:n_samples, 0],
+            comparison_pairs[label,:n_samples, 1],
+            label="pairs",
+            color="red",
+            s=100,
+            marker="x",
+        )
+        ax[label].set_xlabel("Predicted Values",fontsize=fontsize)
+        ax[label].set_ylabel("True Values",fontsize=fontsize)
+        ax[label].set_title(f"Output {label+1}",fontsize=fontsize)
+        ax[label].tick_params(axis='both', which='major', labelsize=fontsize)
+        ax[label].legend(fontsize=fontsize)
+        lims = [
+            np.min([ax[label].get_xlim(), ax[label].get_ylim()]),  # min of both axes
+            np.max([ax[label].get_xlim(), ax[label].get_ylim()]),  # max of both axes
+        ]
+        ax[label].plot(lims, lims, 'k--', linewidth=1)  # 'k--' = black dashed line
+        ax[label].set_xlim(lims)
+        ax[label].set_ylim(lims)
+
+    plt.tight_layout()
+    plt.show()
+    return fig, ax, all_predictions, all_true_values
+
+
 def trim_hist(
     file_list: List[str],
     output_values_start: int,
@@ -342,7 +389,7 @@ def sigmoid_transform(u: torch.Tensor, vmin: float, vmax: float, tau: float = 1.
     """
     alpha = torch.sigmoid((u-(vmax-vmin)/2) / tau)  # in (0,1)
     return vmin + (vmax - vmin) * alpha
-def tanh_transform(u, a, b, s , eps=1e-6, device: str=None):
+def tanh_transform(u, a, b , eps=1e-6, device: str=None):
     """
     Smoothly clamp u to [a, b] while being identity near the midpoint.
     a, b, u can be scalars or tensors (broadcastable).
@@ -359,3 +406,13 @@ def tanh_transform(u, a, b, s , eps=1e-6, device: str=None):
     return m + s * torch.tanh((u - m) / s)
 def l2(gs):
     return torch.sqrt(sum((g**2).sum() for g in gs if g is not None) + 1e-12)
+def return_min_index(voltages, outputs, metric, number_to_return=1):
+    score=[metric(output)[0] for output in torch.tensor(outputs)]
+    score=np.array(score)
+    min_indices=[]
+    for _ in range(number_to_return):
+        min_index=np.argmin(score)
+        min_indices.append(min_index)
+        score[min_index]=float('inf')
+    return voltages[min_indices], outputs[min_indices]
+    

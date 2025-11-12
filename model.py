@@ -4,8 +4,11 @@ import math
 from typing import Tuple, Optional, Callable, Union
 import torch
 from torch import nn, optim
+from torch.quasirandom import SobolEngine
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils import clip_grad_norm_
 import numpy as np
+import importlib
 import matplotlib.pyplot as plt
 
 ROOT_DIR = (os.path.dirname(os.path.abspath(__file__)))
@@ -92,6 +95,7 @@ class ResidualMLP(nn.Module):
         self.dropout = dropout
         self.leak = leak
         self.hidden_dims = hidden_dims
+        self.num_blocks = num_blocks
         self.input = nn.Sequential(
             nn.Linear(input_dim, hidden_dims),
             nn.LeakyReLU(leak)
@@ -199,6 +203,7 @@ class ElectronOpticsPredictor:
         verbose: bool = True,
         checkpoint_name: str = "best_model.pth",
         make_plot: bool = True,
+        early_stopping: bool = True,
     ):
         """Train the model on voltage-value pairs"""
 
@@ -237,11 +242,11 @@ class ElectronOpticsPredictor:
 
         # Setup training
         criterion = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.005)
+        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
 
         # Try OneCycleLR instead of ReduceLROnPlateau
         scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=0.01, epochs=epochs, steps_per_epoch=len(train_loader)
+            optimizer, max_lr=0.001, epochs=epochs, steps_per_epoch=len(train_loader)
         )
         self.scheduler = scheduler.__class__.__name__
         best_val_loss = float("inf")
@@ -285,20 +290,21 @@ class ElectronOpticsPredictor:
             val_losses.append(val_loss)
             self.train_losses = train_losses
             self.val_losses = val_losses
-            # Early stopping
+           
             if val_loss < best_val_loss-tolerance:
                 best_val_loss = val_loss
                 patience_counter = 0
                 # Save best model
                 # J: Why save here without self.save?
                 self.save_model(checkpoint_name)
-            else:
+            # Early stopping
+            elif val_loss >= best_val_loss - tolerance and early_stopping:
                 patience_counter += 1
                 if patience_counter > patience:  # Early stopping patience
                     if verbose:
                         print(f"Early stopping at epoch {epoch}")
                     break
-
+            
             if verbose and epoch % 100 == 0:
                 print(
                     f"Epoch {epoch}: Train Loss = {train_loss:.6f}, Val Loss = {val_loss:.6f}"
@@ -374,6 +380,8 @@ class ElectronOpticsPredictor:
         vstd = torch.as_tensor(
             self.scaler_voltages["std"], dtype=torch.float32, device=device
         )
+        # Add small epsilon to prevent division by zero
+        vstd = torch.clamp(vstd, min=1e-8)
         voltages_norm = (voltages_tensor - vmean) / vstd
 
         voltages_norm.requires_grad_(require_grad)
@@ -406,13 +414,14 @@ class ElectronOpticsPredictor:
     def save_model(self, filepath: str):
         """Save the trained model"""
         torch.save(
-            {
+            {   "model_name": self.model.__class__.__name__,
                 "model_state_dict": self.model.state_dict(),
                 "scaler_voltages": self.scaler_voltages,
                 "scaler_values": self.scaler_values,
                 "input_dim": self.input_dim,
                 "output_dim": self.output_dim,
                 "hidden_dims": self.model.hidden_dims,
+                "num_blocks": self.model.num_blocks,
                 "leak": self.model.leak,
                 "dropout": self.model.dropout,
                 "train_ds": self.train_ds,
@@ -433,23 +442,27 @@ class ElectronOpticsPredictor:
         checkpoint: dict = torch.load(
             filepath, map_location=torch.device(device), weights_only=False
         )
-
+        mod=importlib.import_module("model")
         # Recreate model with proper dimensions
         predictor = cls(
             input_dim=checkpoint["input_dim"],
             output_dim=checkpoint.get("output_dim", 1),
             device=device,
-            leak=checkpoint.get("leak", 0.0),
+            model=getattr(mod, checkpoint.get("model_name")),
+            leak=checkpoint.get("leak"),
+            dropout=checkpoint.get("dropout"),
+            hidden_dims=checkpoint.get("hidden_dims"),
+            num_blocks=checkpoint.get("num_blocks"),
+            
+            
         )
         # Load state and scalers
+
         predictor.model.load_state_dict(checkpoint["model_state_dict"])
         predictor.scaler_voltages = checkpoint["scaler_voltages"]
         predictor.scaler_values   = checkpoint["scaler_values"]
         predictor.input_dim       = checkpoint["input_dim"]
         predictor.output_dim      = checkpoint["output_dim"]
-        predictor.model.hidden_dims = checkpoint["hidden_dims"]
-        predictor.model.leak      = checkpoint["leak"]
-        predictor.model.dropout   = checkpoint["dropout"]
         predictor.train_ds        = checkpoint["train_ds"]
         predictor.validation_ds   = checkpoint["validation_ds"]
         predictor.train_ds_norm   = checkpoint["train_ds_norm"]
@@ -472,6 +485,8 @@ def optimize_voltages(
     hyperparameters: dict = {'strength': 0, 'min': float('-inf'), 'max': float('inf'), 's': 100000},
     device= None,
     clamp: bool = False,
+    initial_voltages: Optional[np.ndarray] = None,
+    seed: Optional[int] = 0,
 ):
     """Find voltages that optimize the predicted values according to a custom objective
 
@@ -516,22 +531,42 @@ def optimize_voltages(
     else:
         # Use the provided custom objective function
         objective_func = objective_function
-    
+    if initial_voltages and len(initial_voltages)==1:
+            initial_voltages =[initial_voltages]
     for restart in range(random_restarts):
         losses = []
         metric_values = []
         regularizer_values = []
         rhos = []
         # Initialize voltages
-        if voltage_bounds is not None:
-            voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1],size=predictors[0].input_dim)
+        
+        if voltage_bounds:
+            if initial_voltages:
+                voltages = initial_voltages.pop()
+                voltages = np.array(voltages)
+                 # only use initial voltages for first restart
+            else:
+                if restart==0:
+                    sob = SobolEngine(14, scramble=True, seed=seed)
+                voltages = sob.draw(1).squeeze(0).numpy()
+                voltages = voltage_bounds[0] + (voltage_bounds[1]-voltage_bounds[0]) * voltages
+                # voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1],size=predictors[0].input_dim)
         else:
-            voltages = np.random.uniform(
+            if initial_voltages:
+                voltages = initial_voltages.pop()
+                voltages = np.array(voltages)
+                 # only use initial voltages for first restart
+            else: 
+                if restart==0:
+                    sob = SobolEngine(predictors[0].input_dim, scramble=True, seed=seed)
+                voltages = sob.draw(1).squeeze(0).numpy()
+                voltages = np.min(predictors[0].train_ds.voltages.numpy(), axis=0) + (np.max(predictors[0].train_ds.voltages.numpy(), axis=0)-np.min(predictors[0].train_ds.voltages.numpy(), axis=0)) * voltages 
+            #     voltages = np.random.uniform(
 
-                np.min(predictors[0].train_ds.voltages.numpy(), axis=0),
-                np.max(predictors[0].train_ds.voltages.numpy(), axis=0),
-                size=predictors[0].input_dim,
-            )
+            #     np.min(predictors[0].train_ds.voltages.numpy(), axis=0),
+            #     np.max(predictors[0].train_ds.voltages.numpy(), axis=0),
+            #     size=predictors[0].input_dim,
+            # )
 
         # Normalize initial voltages
 
@@ -559,9 +594,13 @@ def optimize_voltages(
 
             predictions = predictions.to(device)
 
-            strength, a, b, s = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max'], hyperparameters['s']
-            u = tanh_transform(voltages_tensor, a, b, s)  # apply sigmoid transform so that the voltages stay within [a,b]
-            regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum()
+            strength, a, b = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max']
+            u = tanh_transform(voltages_tensor, a, b)  # apply sigmoid transform so that the voltages stay within [a,b]
+
+            # Add epsilon to prevent log(0) and ensure numerical stability
+            eps = 1e-8
+            u_safe = torch.clamp(u, min=a + eps, max=b - eps)
+            regularizing_term = -strength * (torch.log((u_safe-a)/(b-a) + eps) + torch.log((b-u_safe)/(b-a) + eps)).sum()
 
             # Compute loss 
 
@@ -579,7 +618,28 @@ def optimize_voltages(
                 rhos.append(rho)
             optimizer.zero_grad()
             loss.backward()
+            
+            # Check for NaN gradients and clip them
+            if torch.isnan(loss):
+                print(f"Warning: Loss is NaN at iteration {iteration}")
+                break
+                
+            # Clip gradients to prevent exploding gradients
+            if voltages_tensor.grad is not None:
+                clip_grad_norm_(voltages_tensor, max_norm=1.0)
+            
+            # Check for NaN in voltages_tensor before step
+            if torch.isnan(voltages_tensor).any():
+                print(f"Warning: voltages_tensor contains NaN before optimizer step at iteration {iteration}")
+                break
+                
             optimizer.step()
+            
+            # Check for NaN in voltages_tensor after step
+            if torch.isnan(voltages_tensor).any():
+                print(f"Warning: voltages_tensor contains NaN after optimizer step at iteration {iteration}")
+                # Reset voltages_tensor to last good values or reinitialize
+                break
             
 
             # Optionally constrain to training range
@@ -644,8 +704,11 @@ def optimize_voltages_gradnorm(
     random_restarts: int = 5,
     voltage_bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     hyperparameters: dict = {'strength': 0, 'min': float('-inf'), 'max': float('inf'), 's': 100000, 'alpha': 0.12},
+    seed: Optional[int] = 0,
     device='cpu',
     clamp: bool = False,
+    initial_voltages: Optional[np.ndarray] = None,
+    figsize=(8,20)
 ):
     """Find voltages that optimize the predicted values according to a custom objective
 
@@ -672,7 +735,8 @@ def optimize_voltages_gradnorm(
     best_voltages = None
     best_values = None
     best_objective = float("inf")
-    fig,ax = plt.subplots(random_restarts,2,figsize=(8,20))
+    fig,ax = plt.subplots(random_restarts,2,figsize=figsize)
+    ax = np.atleast_2d(ax)
     # Define the objective function
     if objective_function is None:
         if weights is not None:
@@ -690,7 +754,8 @@ def optimize_voltages_gradnorm(
     else:
         # Use the provided custom objective function
         objective_func = objective_function
-
+    if initial_voltages and len(initial_voltages)==1:
+        initial_voltages = [initial_voltages]
     restart_results = []
     for restart in range(random_restarts):
         losses = []
@@ -698,15 +763,28 @@ def optimize_voltages_gradnorm(
         regularizer_values = []
         rhos = []
         # Initialize voltages
-        if voltage_bounds is not None:
-            voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1],size=predictors[0].input_dim)
+       
+        if voltage_bounds:
+            if initial_voltages:
+                voltages = initial_voltages.pop()
+                voltages = np.array(voltages)
+                 # only use initial voltages for first restart
+            else:
+                if restart==0:
+                    sob = SobolEngine(14, scramble=True, seed=seed)
+                voltages = sob.draw(1).squeeze(0).numpy()
+                voltages = voltage_bounds[0] + (voltage_bounds[1]-voltage_bounds[0]) * voltages
+                # voltages = np.random.uniform(voltage_bounds[0], voltage_bounds[1],size=predictors[0].input_dim)
         else:
-            voltages = np.random.uniform(
-
-                np.min(predictors[0].train_ds.voltages.numpy(), axis=0),
-                np.max(predictors[0].train_ds.voltages.numpy(), axis=0),
-                size=predictors[0].input_dim,
-            )
+            if initial_voltages:
+                voltages = initial_voltages.pop()
+                voltages = np.array(voltages)
+                 # only use initial voltages for first restart
+            else: 
+                if restart==0:
+                    sob = SobolEngine(predictors[0].input_dim, scramble=True, seed=seed)
+                voltages = sob.draw(1).squeeze(0).numpy()
+                voltages = np.min(predictors[0].train_ds.voltages.numpy(), axis=0) + (np.max(predictors[0].train_ds.voltages.numpy(), axis=0)-np.min(predictors[0].train_ds.voltages.numpy(), axis=0)) * voltages 
 
         # Normalize initial voltages
 
@@ -738,11 +816,15 @@ def optimize_voltages_gradnorm(
                 predictions = torch.cat((predictions, prediction), dim=0)
 
             predictions = predictions.to(device)
-            if hyperparameters['strength'] != 0:
-                strength, a, b, s = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max'], hyperparameters['s']
-                u = tanh_transform(voltages_tensor, a, b, s,device=device)  # apply sigmoid transform so that the voltages stay within [a,b]
-                regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum()
 
+            if hyperparameters['strength'] != 0:
+                strength, a, b = hyperparameters['strength'], hyperparameters['min'], hyperparameters['max']
+                u = tanh_transform(voltages_tensor, a, b, device=device)  # apply sigmoid transform so that the voltages stay within [a,b]
+                if (u.isnan()).any():
+                   print("NaN encountered in voltage transform")
+                regularizing_term = -strength * (torch.log((u-a)/(b-a))+torch.log((b-u)/(b-a))).sum()
+                if regularizing_term==np.inf:
+                    print("Inf encountered in regularizing term")
             # Compute loss 
 
             metric_values = objective_func(predictions,device=device)
@@ -837,7 +919,8 @@ def optimize_voltages_gradnorm(
                 best_objective = final_objective
                 best_voltages = voltages_tensor.cpu().numpy()
                 best_values = final_predictions
-    print(f'Restart {restart+1}, best objective: {best_objective}')
+                best_restart = restart
+    print(f'Restart {best_restart+1}, best objective: {best_objective}')
     return (
         best_voltages,
         best_values,
