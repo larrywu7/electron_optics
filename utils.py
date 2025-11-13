@@ -41,7 +41,7 @@ def run_inference(
 
             # Store predictions and ground truth
             all_predictions_norm.append(outputs.cpu().numpy())
-            all_values_norm.append(batch_values.numpy())
+            all_values_norm.append(batch_values.cpu().numpy())
 
     # 4. Concatenate all batches
     all_predictions_norm = np.vstack(all_predictions_norm)
