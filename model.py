@@ -533,6 +533,7 @@ def optimize_voltages(
         objective_func = objective_function
     if initial_voltages and len(initial_voltages)==1:
             initial_voltages =[initial_voltages]
+    sob=None
     for restart in range(random_restarts):
         losses = []
         metric_values = []
@@ -546,7 +547,7 @@ def optimize_voltages(
                 voltages = np.array(voltages)
                  # only use initial voltages for first restart
             else:
-                if restart==0:
+                if sob is None:
                     sob = SobolEngine(14, scramble=True, seed=seed)
                 voltages = sob.draw(1).squeeze(0).numpy()
                 voltages = voltage_bounds[0] + (voltage_bounds[1]-voltage_bounds[0]) * voltages
@@ -556,8 +557,8 @@ def optimize_voltages(
                 voltages = initial_voltages.pop()
                 voltages = np.array(voltages)
                  # only use initial voltages for first restart
-            else: 
-                if restart==0:
+            else:
+                if sob is None:
                     sob = SobolEngine(predictors[0].input_dim, scramble=True, seed=seed)
                 voltages = sob.draw(1).squeeze(0).numpy()
                 voltages = np.min(predictors[0].train_ds.voltages.numpy(), axis=0) + (np.max(predictors[0].train_ds.voltages.numpy(), axis=0)-np.min(predictors[0].train_ds.voltages.numpy(), axis=0)) * voltages 
@@ -757,6 +758,9 @@ def optimize_voltages_gradnorm(
     if initial_voltages and len(initial_voltages)==1:
         initial_voltages = [initial_voltages]
     restart_results = []
+    sob=None
+    log_weights_restarts=[]
+    log_loss_restarts=[]
     for restart in range(random_restarts):
         losses = []
         metric_values = []
@@ -770,7 +774,7 @@ def optimize_voltages_gradnorm(
                 voltages = np.array(voltages)
                  # only use initial voltages for first restart
             else:
-                if restart==0:
+                if sob is None:
                     sob = SobolEngine(14, scramble=True, seed=seed)
                 voltages = sob.draw(1).squeeze(0).numpy()
                 voltages = voltage_bounds[0] + (voltage_bounds[1]-voltage_bounds[0]) * voltages
@@ -884,8 +888,10 @@ def optimize_voltages_gradnorm(
 
 
         log_weights = np.array(log_weights).T
+        log_weights_restarts.append(log_weights)
         log_loss = np.array(log_loss).T
-        
+        log_loss_restarts.append(log_loss)
+
         for i in range(log_weights.shape[0]):
             ax[restart, 0].plot(log_weights[i], label=f"weight {i} (Restart {restart+1})")
             ax[restart, 1].plot(log_loss[i], label=f"loss (Restart {restart+1}, part {i})")
@@ -925,7 +931,7 @@ def optimize_voltages_gradnorm(
         best_voltages,
         best_values,
         best_objective,
-    ), restart_results, (np.stack(log_weights), np.stack(log_loss))  # best_values is best predicted output_values and best_objective is best metric value.
+    ), restart_results, (np.stack(log_weights_restarts), np.stack(log_loss_restarts))  # best_values is best predicted output_values and best_objective is best metric value.
 
 
 
